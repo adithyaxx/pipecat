@@ -64,10 +64,31 @@ class BedrockContextAggregatorPair:
 
 
 class BedrockUserContextAggregator(LLMUserContextAggregator):
-    pass
+    def __init__(
+        self,
+        context: BedrockLLMContext,
+        aggregation_timeout: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(context=context, aggregation_timeout=aggregation_timeout, **kwargs)
+    
+    def get_context_frame(self) -> BedrockLLMContextFrame:
+        return BedrockLLMContextFrame(context=self.context)
 
 
 class BedrockAssistantContextAggregator(LLMAssistantContextAggregator):
+    def __init__(
+            self, 
+            context: BedrockLLMContext, 
+            *, 
+            expect_stripped_words: bool = True, 
+            **kwargs
+    ):
+        super().__init__(context=context, expect_stripped_words=expect_stripped_words, **kwargs)
+    
+    def get_context_frame(self) -> BedrockLLMContextFrame:
+        return BedrockLLMContextFrame(context=self.context)
+        
     async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
         # Format tool use according to Bedrock API
         self._context.add_message(

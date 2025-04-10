@@ -35,6 +35,7 @@ from pipecat.processors.aggregators.bedrock_llm_context import (
     BedrockLLMContext,
     BedrockLLMContextFrame,
 )
+from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContextFrame
 from pipecat.processors.aggregators.llm_response import (
     LLMAssistantContextAggregator,
     LLMUserContextAggregator,
@@ -44,12 +45,29 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.ai_services import LLMService
 from pipecat.services.aws.llm import BedrockLLMContext, BedrockContextAggregatorPair
 
-from .events import SessionProperties
+from .events import (
+    SessionProperties,
+    ConversationItemCreateEvent,
+    ResponseCreateEvent,
+    ResponseProperties
+)
 from .context import (
     BedrockRealtimeAssistantContextAggregator,
     BedrockRealtimeLLMContext,
     BedrockRealtimeUserContextAggregator,
 )
+
+
+@dataclass
+class BedrockRealtimeContextAggregatorPair:
+    _user: BedrockRealtimeUserContextAggregator
+    _assistant: BedrockRealtimeAssistantContextAggregator
+
+    def user(self) -> BedrockRealtimeUserContextAggregator:
+        return self._user
+
+    def assistant(self) -> BedrockRealtimeAssistantContextAggregator:
+        return self._assistant
 
 
 class BedrockRealtimeLLMService(LLMService):
@@ -90,6 +108,7 @@ class BedrockRealtimeLLMService(LLMService):
         self.aws_region = aws_region
         self.session_properties = session_properties
         self.audio_paused = start_audio_paused
+        self._context = None
         
         # AWS credentials
         self.aws_access_key = aws_access_key
@@ -121,6 +140,11 @@ class BedrockRealtimeLLMService(LLMService):
         # Tool use tracking
         self.toolUseId = ""
         self.toolName = ""
+        
+        # API session state
+        self._api_session_ready = False
+        self._run_llm_when_api_session_ready = False
+        self._messages_added_manually = {}
         
         logger.info(f"Initialized BedrockRealtimeLLMService with model {self.model_id}")
     
@@ -166,13 +190,27 @@ class BedrockRealtimeLLMService(LLMService):
             A pair of context aggregators for user and assistant
         """
         context.set_llm_adapter(self.get_llm_adapter())
-        
+
         if isinstance(context, OpenAILLMContext) and not isinstance(context, BedrockLLMContext):
             context = BedrockLLMContext.from_openai_context(context)
         
         user = BedrockRealtimeUserContextAggregator(context, **user_kwargs)
         assistant = BedrockRealtimeAssistantContextAggregator(context, **assistant_kwargs)
         return BedrockContextAggregatorPair(_user=user, _assistant=assistant)
+    
+    async def _connect(self):
+        """Connect to the Bedrock service and initialize the stream."""
+        if self.is_active:
+            return True
+        
+        return await self.initialize_stream()
+    
+    async def _disconnect(self):
+        """Disconnect from the Bedrock service."""
+        if not self.is_active:
+            return
+        
+        await self.close()
     
     async def initialize_stream(self):
         """Initialize the bidirectional stream with Bedrock."""
@@ -206,11 +244,19 @@ class BedrockRealtimeLLMService(LLMService):
             if not self.audio_paused:
                 asyncio.create_task(self._process_audio_input())
             
-            logger.info("Bedrock Realtime stream initialized successfully")
+            # Mark API session as ready
+            self._api_session_ready = True
+            
+            # If we have a pending LLM run, do it now
+            if self._run_llm_when_api_session_ready:
+                self._run_llm_when_api_session_ready = False
+                await self._create_response()
+            
+            logger.info("Bedrock stream initialized successfully")
             return True
         except Exception as e:
             self.is_active = False
-            logger.error(f"Failed to initialize Bedrock Realtime stream: {str(e)}")
+            logger.error(f"Failed to initialize Bedrock stream: {str(e)}")
             return False
     
     async def send_raw_event(self, event_json):
@@ -225,7 +271,9 @@ class BedrockRealtimeLLMService(LLMService):
         
         try:
             await self.stream_response.input_stream.send(event)
-            logger.debug(f"Sent event: {event_json[:200]}...")
+            event_type = list(json.loads(event_json).get("event", {}).keys())
+            # if event_type != 'audioInput':
+            logger.debug(f"Sent event: {event_type[0]} ({json.loads(event_json)["event"][event_type[0]].get("type", "None")})")
         except Exception as e:
             logger.error(f"Error sending event: {str(e)}")
     
@@ -260,13 +308,17 @@ class BedrockRealtimeLLMService(LLMService):
         """Process incoming responses from Bedrock."""
         try:
             while self.is_active:
+                logger.debug("Listening for incoming responses from Bedrock.")
                 try:
                     output = await self.stream_response.await_output()
                     result = await output[1].receive()
+                    logger.debug(f"Listening for incoming responses from Bedrock: {result}")
                     if result.value and result.value.bytes_:
                         try:
                             response_data = result.value.bytes_.decode('utf-8')
                             json_data = json.loads(response_data)
+
+                            logger.debug(f"Received: {json_data}")
                             
                             # Handle different response types
                             if 'event' in json_data:
@@ -314,7 +366,7 @@ class BedrockRealtimeLLMService(LLMService):
                                     
                                     # Call the function
                                     await self.call_function(
-                                        context=None,  # We don't have context here
+                                        context=self._context,
                                         tool_call_id=self.toolUseId,
                                         function_name=self.toolName,
                                         arguments=tool_input
@@ -352,7 +404,77 @@ class BedrockRealtimeLLMService(LLMService):
             logger.error(f"Response processing error: {e}")
         finally:
             self.is_active = False
+            self._api_session_ready = False
     
+    async def reset_conversation(self):
+        """Reset the conversation by disconnecting and reconnecting."""
+        # Disconnect/reconnect is the safest way to start a new conversation.
+        # Note that this will fail if called from the receive task.
+        logger.debug("Resetting conversation")
+        await self._disconnect()
+        if self._context:
+            self._context.llm_needs_settings_update = True
+            self._context.llm_needs_initial_messages = True
+        await self._connect()
+
+    async def _update_settings(self, settings=None):
+        """Update service settings."""
+        if not settings:
+            settings = {}
+        
+        # Handle audio pause/unpause
+        if "audio_paused" in settings:
+            old_paused = self.audio_paused
+            self.audio_paused = settings["audio_paused"]
+            
+            if old_paused and not self.audio_paused:
+                # Audio was paused and now unpaused, start processing
+                asyncio.create_task(self._process_audio_input())
+            elif not old_paused and self.audio_paused:
+                # Audio was unpaused and now paused, send content end
+                await self.send_raw_event(self._create_content_end_event(content_name=self.audio_content_name))
+                # Generate a new audio content name for the next turn
+                self.audio_content_name = str(uuid.uuid4())
+    
+    async def send_client_event(self, event):
+        """Send a client event."""
+        # This is a placeholder for compatibility with OpenAI client
+        # In the Bedrock implementation, we don't need to send client events
+        # in the same way as OpenAI
+        pass
+
+    async def _create_response(self):
+        """Create a response from the current context."""
+        if not self._api_session_ready:
+            self._run_llm_when_api_session_ready = True
+            return
+
+        if self._context.llm_needs_initial_messages:
+            messages = self._context.get_messages_for_initializing_history()
+            for item in messages:
+                evt = ConversationItemCreateEvent(item=item)
+                self._messages_added_manually[evt.item.id] = True
+                await self.send_client_event(evt)
+            self._context.llm_needs_initial_messages = False
+
+        if self._context.llm_needs_settings_update:
+            await self._update_settings()
+            self._context.llm_needs_settings_update = False
+
+        logger.debug(f"Creating response: {self._context.get_messages_for_logging()}")
+
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.start_processing_metrics()
+        await self.start_ttfb_metrics()
+        await self.send_client_event(
+            ResponseCreateEvent(
+                response=ResponseProperties(modalities=["audio", "text"])
+            )
+        )
+        
+        # Process the context messages
+        await self._process_context(self._context)
+
     async def call_function(
         self,
         context: Optional[BedrockLLMContext],
@@ -423,7 +545,7 @@ class BedrockRealtimeLLMService(LLMService):
         
         # Initialize stream if not already active
         if not self.is_active:
-            await self.initialize_stream()
+            await self._connect()
         
         if isinstance(frame, AudioRawFrame) and not self.audio_paused:
             # Add audio to the queue
@@ -432,10 +554,14 @@ class BedrockRealtimeLLMService(LLMService):
                 'prompt_name': self.prompt_name,
                 'content_name': self.audio_content_name
             })
-        elif isinstance(frame, BedrockLLMContextFrame):
-            context: BedrockRealtimeLLMContext = BedrockRealtimeLLMContext.upgrade_to_realtime(
-                frame.context
-            )
+        elif isinstance(frame, BedrockLLMContextFrame) or isinstance(frame, OpenAILLMContextFrame):
+            if isinstance(frame, OpenAILLMContextFrame):
+                context = BedrockRealtimeLLMContext.upgrade_to_realtime(
+                    BedrockLLMContext.from_openai_context(frame.context)
+                )
+            else:
+                context = BedrockRealtimeLLMContext.upgrade_to_realtime(frame.context)
+                
             if not self._context:
                 self._context = context
             elif frame.context is not self._context:
@@ -463,8 +589,6 @@ class BedrockRealtimeLLMService(LLMService):
             context: The LLM context to process
         """
         try:
-            await self.push_frame(LLMFullResponseStartFrame())
-            await self.start_processing_metrics()
             await self.start_ttfb_metrics()
             
             # Send each message in the context
@@ -498,7 +622,7 @@ class BedrockRealtimeLLMService(LLMService):
                 ))
             
             # End the prompt to get a response
-            await self.send_raw_event(self._create_prompt_end_event())
+            # await self.send_raw_event(self._create_prompt_end_event())
             
             # Stop TTFB metrics after we get the first response
             await self.stop_ttfb_metrics()
@@ -511,33 +635,14 @@ class BedrockRealtimeLLMService(LLMService):
             await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
     
-    async def _update_settings(self, settings: Dict[str, Any]) -> None:
-        """
-        Update service settings.
-        
-        Args:
-            settings: The settings to update
-        """
-        # Handle audio pause/unpause
-        if "audio_paused" in settings:
-            old_paused = self.audio_paused
-            self.audio_paused = settings["audio_paused"]
-            
-            if old_paused and not self.audio_paused:
-                # Audio was paused and now unpaused, start processing
-                asyncio.create_task(self._process_audio_input())
-            elif not old_paused and self.audio_paused:
-                # Audio was unpaused and now paused, send content end
-                await self.send_raw_event(self._create_content_end_event(content_name=self.audio_content_name))
-                # Generate a new audio content name for the next turn
-                self.audio_content_name = str(uuid.uuid4())
-    
     async def close(self):
         """Close the stream properly."""
         if not self.is_active:
             return
         
         self.is_active = False
+        self._api_session_ready = False
+        
         if self.response_task and not self.response_task.done():
             self.response_task.cancel()
         
@@ -593,7 +698,6 @@ class BedrockRealtimeLLMService(LLMService):
             tools_config = {"tools": tools}
         
         # Determine voice ID
-        voice_id = "matthew"  # Default voice
         if self.session_properties.voice:
             voice_id = self.session_properties.voice
             
@@ -639,11 +743,11 @@ class BedrockRealtimeLLMService(LLMService):
         }
         
         # Add noise reduction if enabled
-        # if (self.session_properties.input_audio_noise_reduction and 
-        #     self.session_properties.input_audio_noise_reduction.enabled):
-        #     audio_input_config["noiseReduction"] = {
-        #         "type": self.session_properties.input_audio_noise_reduction.type
-        #     }
+        if (self.session_properties.input_audio_noise_reduction and 
+            self.session_properties.input_audio_noise_reduction.enabled):
+            audio_input_config["noiseReduction"] = {
+                "type": self.session_properties.input_audio_noise_reduction.type
+            }
             
         return json.dumps({
             "event": {
