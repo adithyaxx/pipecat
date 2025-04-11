@@ -36,8 +36,6 @@ class SemanticTurnDetection(BaseModel):
 class SessionProperties(BaseModel):
     instructions: Optional[str] = None
     voice: Optional[str] = "matthew"
-    input_audio_transcription: Optional[InputAudioTranscription] = None
-    input_audio_noise_reduction: Optional[InputAudioNoiseReduction] = None
     tools: Optional[List[Dict]] = None
     tool_choice: Optional[Literal["auto", "none", "required"]] = None
     temperature: Optional[float] = None

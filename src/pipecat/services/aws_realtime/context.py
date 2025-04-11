@@ -55,7 +55,7 @@ class BedrockRealtimeLLMContext(BedrockLLMContext):
             if isinstance(message.get("content"), list):
                 content = ""
                 for c in message.get("content"):
-                    if c.get("type") == "text":
+                    if c.get("text"):
                         content += " " + c.get("text")
                     else:
                         logger.error(
