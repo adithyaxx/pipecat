@@ -170,6 +170,9 @@ class PollyTTSService(TTSService):
                 "or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables."
             )
 
+        # Detect and ignore <thinking> blocks
+        self._thinking_tag_detected = False
+
     def can_generate_metrics(self) -> bool:
         return True
 
@@ -210,6 +213,46 @@ class PollyTTSService(TTSService):
 
         return ssml
 
+    def _sanitise_text(self, text: str) -> str:
+        result = ""
+        i = 0
+        
+        while i < len(text):
+            # If we're already inside a thinking tag from a previous call
+            if self._thinking_tag_detected:
+                # Look for the closing tag
+                closing_index = text.find("</thinking>", i)
+                if closing_index != -1:
+                    # Found the closing tag, skip to after it
+                    i = closing_index + len("</thinking>")
+                    self._thinking_tag_detected = False
+                else:
+                    # No closing tag found in this chunk, skip the entire chunk
+                    break
+            else:
+                # Look for opening tag
+                opening_index = text.find("<thinking>", i)
+                if opening_index != -1:
+                    # Add text before the opening tag
+                    result += text[i:opening_index]
+                    i = opening_index + len("<thinking>")
+                    self._thinking_tag_detected = True
+                    
+                    # Look for closing tag in the same chunk
+                    closing_index = text.find("</thinking>", i)
+                    if closing_index != -1:
+                        # Found the closing tag, skip to after it
+                        i = closing_index + len("</thinking>")
+                        self._thinking_tag_detected = False
+                else:
+                    # No opening tag found, add the rest of the text
+                    result += text[i:]
+                    break
+        
+        logger.debug(f"_sanitise_text - before: {text}")
+        logger.debug(f"_sanitise_text - after: {result}")
+        return result
+
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
         def read_audio_data(**args):
             response = self._polly_client.synthesize_speech(**args)
@@ -223,8 +266,11 @@ class PollyTTSService(TTSService):
         try:
             await self.start_ttfb_metrics()
 
+            # Sanitize
+            sanitised_text = self._sanitise_text(text)
+
             # Construct the parameters dictionary
-            ssml = self._construct_ssml(text)
+            ssml = self._construct_ssml(sanitised_text)
 
             params = {
                 "Text": ssml,

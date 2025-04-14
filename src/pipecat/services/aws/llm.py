@@ -316,8 +316,22 @@ class BedrockLLMContext(OpenAILLMContext):
                     # in the proper format
                     if isinstance(message["content"], str):
                         message["content"] = [{"text": message["content"]}]
-                    # append the content of this message to the last message
-                    self.messages[-1]["content"].extend(message["content"])
+                    # append the content of this message to the last message if both are text
+                    current_msg_all_text = all(
+                        isinstance(item, dict) and "text" in item 
+                        for item in message["content"]
+                    )
+                    prev_msg_all_text = all(
+                        isinstance(item, dict) and "text" in item 
+                        for item in self.messages[-1]["content"]
+                    )
+                    if current_msg_all_text and prev_msg_all_text:
+                        self.messages[-1]["content"].extend(message["content"])
+                    else:
+                        # add a dummy assistant message since conversation blocks and tool result blocks 
+                        # cannot be provided in the same turn for Nova models.
+                        self.messages.append({"role": "assistant", "content": [{"text": "(empty)"}]}) 
+                        self.messages.append(message)
                 else:
                     self.messages.append(message)
             else:
@@ -329,6 +343,8 @@ class BedrockLLMContext(OpenAILLMContext):
         """Restructure messages in Bedrock format by handling system messages, 
         merging consecutive messages with the same role, and ensuring proper content formatting.
         """
+        logger.debug(f"Before: {self.messages}")
+
         # Handle system message if present at the beginning
         logger.debug(f"_restructure_from_bedrock_messages: {self.messages}")
         if self.messages and self.messages[0]["role"] == "system":
@@ -359,11 +375,30 @@ class BedrockLLMContext(OpenAILLMContext):
                     elif isinstance(item, str) and item == "":
                         msg["content"][idx] = {"text": "(empty)"}
 
-        # Merge consecutive messages with the same role
+        logger.debug(f"After: {self.messages}")
+
+        # Merge consecutive messages with the same role only if content is text
         merged_messages = []
         for msg in self.messages:
             if merged_messages and merged_messages[-1]["role"] == msg["role"]:
-                merged_messages[-1]["content"].extend(msg["content"])
+                # Check if all content items in both messages are text
+                current_msg_all_text = all(
+                    isinstance(item, dict) and "text" in item 
+                    for item in msg["content"]
+                )
+                prev_msg_all_text = all(
+                    isinstance(item, dict) and "text" in item 
+                    for item in merged_messages[-1]["content"]
+                )
+                
+                # Only merge if both messages contain only text content
+                if current_msg_all_text and prev_msg_all_text:
+                    merged_messages[-1]["content"].extend(msg["content"])
+                else:
+                    # add a dummy assistant message since conversation blocks and tool result blocks 
+                    # cannot be provided in the same turn for Nova models.
+                    merged_messages.append({"role": "assistant", "content": [{"text": "(empty)"}]}) 
+                    merged_messages.append(msg)
             else:
                 merged_messages.append(msg)
         
