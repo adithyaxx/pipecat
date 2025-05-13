@@ -105,7 +105,6 @@ class AWSBedrockLLMContext(OpenAILLMContext):
     @classmethod
     def from_messages(cls, messages: List[dict]) -> "AWSBedrockLLMContext":
         self = cls(messages=messages)
-        self._restructure_from_openai_messages()
         return self
 
     @classmethod
@@ -118,7 +117,6 @@ class AWSBedrockLLMContext(OpenAILLMContext):
 
     def set_messages(self, messages: List):
         self._messages[:] = messages
-        self._restructure_from_openai_messages()
 
     # convert a message in AWS Bedrock format into one or more messages in OpenAI format
     def to_standard_messages(self, obj):
