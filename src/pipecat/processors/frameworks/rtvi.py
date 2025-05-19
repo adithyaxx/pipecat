@@ -407,6 +407,7 @@ class RTVIObserverParams:
         user_llm_enabled (bool): Indicates if the user's LLM input messages should be sent.
         user_speaking_enabled (bool): Indicates if the user's started/stopped speaking messages should be sent.
         user_transcription_enabled (bool): Indicates if user's transcription messages should be sent.
+        function_call_result_enabled (bool): Indicates if function call result messages should be sent.
         metrics_enabled (bool): Indicates if metrics messages should be sent.
         errors_enabled (bool): Indicates if errors messages should be sent.
     """
@@ -417,6 +418,7 @@ class RTVIObserverParams:
     user_llm_enabled: bool = True
     user_speaking_enabled: bool = True
     user_transcription_enabled: bool = True
+    function_call_result_enabled: bool = True
     metrics_enabled: bool = True
     errors_enabled: bool = True
 
@@ -506,6 +508,13 @@ class RTVIObserver(BaseObserver):
         elif isinstance(frame, RTVIServerMessageFrame):
             message = RTVIServerMessage(data=frame.data)
             await self.push_transport_message_urgent(message)
+        elif isinstance(frame, FunctionCallResultFrame) and self._params.function_call_result_enabled:
+            # Only process the downstream FunctionCallResultFrame to avoid duplicates
+            if direction == FrameDirection.DOWNSTREAM:
+                await self._handle_function_call_result_frame(frame)
+            else:
+                # Skip upstream duplicate
+                mark_as_seen = True
 
         if mark_as_seen:
             self._frames_seen.add(frame.id)
@@ -626,6 +635,19 @@ class RTVIObserver(BaseObserver):
 
         message = RTVIMetricsMessage(data=metrics)
         await self.push_transport_message_urgent(message)
+
+    async def _handle_function_call_result_frame(self, frame: FunctionCallResultFrame):
+        """Process function call result frames for the RTVI client.
+        
+        This emits the RTVIEvent.LLMFunctionCall event that is consumed by clients.
+        """
+        message_data = RTVILLMFunctionCallMessageData(
+            function_name=frame.function_name,
+            tool_call_id=frame.tool_call_id,
+            args=frame.arguments,
+        )
+        message = RTVILLMFunctionCallMessage(data=message_data)
+        await self.push_transport_message_urgent(message, exclude_none=False)
 
 
 class RTVIProcessor(FrameProcessor):
