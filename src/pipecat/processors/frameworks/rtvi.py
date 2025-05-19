@@ -509,12 +509,9 @@ class RTVIObserver(BaseObserver):
             message = RTVIServerMessage(data=frame.data)
             await self.push_transport_message_urgent(message)
         elif isinstance(frame, FunctionCallResultFrame) and self._params.function_call_result_enabled:
-            # Only process the downstream FunctionCallResultFrame to avoid duplicates
-            if direction == FrameDirection.DOWNSTREAM:
+            # Only process the upstream FunctionCallResultFrame to avoid duplicates
+            if direction == FrameDirection.UPSTREAM:
                 await self._handle_function_call_result_frame(frame)
-            else:
-                # Skip upstream duplicate
-                mark_as_seen = True
 
         if mark_as_seen:
             self._frames_seen.add(frame.id)
