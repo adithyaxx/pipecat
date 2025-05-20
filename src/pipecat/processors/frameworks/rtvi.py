@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     EndTaskFrame,
     ErrorFrame,
     Frame,
+    FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
@@ -273,11 +274,29 @@ class RTVILLMFunctionCallStartMessage(BaseModel):
     data: RTVILLMFunctionCallStartMessageData
 
 
-class RTVILLMFunctionCallResultData(BaseModel):
+class RTVILLMFunctionCallInProgressMessageData(BaseModel):
+    function_name: str
+    tool_call_id: str
+    args: dict
+
+
+class RTVILLMFunctionCallInProgressMessage(BaseModel):
+    label: RTVIMessageLiteral = RTVI_MESSAGE_LABEL
+    type: Literal["llm-function-call"] = "llm-function-call"
+    data: RTVILLMFunctionCallInProgressMessageData
+
+
+class RTVILLMFunctionCallResultMessageData(BaseModel):
     function_name: str
     tool_call_id: str
     arguments: dict
     result: dict | str
+
+
+class RTVILLMFunctionCallResultMessage(BaseModel):
+    label: RTVIMessageLiteral = RTVI_MESSAGE_LABEL
+    type: Literal["llm-function-call"] = "llm-function-call"
+    data: RTVILLMFunctionCallResultMessageData
 
 
 class RTVIBotLLMStartedMessage(BaseModel):
@@ -508,6 +527,10 @@ class RTVIObserver(BaseObserver):
         elif isinstance(frame, RTVIServerMessageFrame):
             message = RTVIServerMessage(data=frame.data)
             await self.push_transport_message_urgent(message)
+        elif isinstance(frame, FunctionCallInProgressFrame) and self._params.function_call_result_enabled:
+            # Only process the upstream FunctionCallInProgressFrame to avoid duplicates
+            if direction == FrameDirection.UPSTREAM:
+                await self._handle_function_call_in_progress(frame)
         elif isinstance(frame, FunctionCallResultFrame) and self._params.function_call_result_enabled:
             # Only process the upstream FunctionCallResultFrame to avoid duplicates
             if direction == FrameDirection.UPSTREAM:
@@ -632,18 +655,32 @@ class RTVIObserver(BaseObserver):
 
         message = RTVIMetricsMessage(data=metrics)
         await self.push_transport_message_urgent(message)
+    
+    async def _handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
+        """Process function call in progress frames for the RTVI client.
+        
+        This emits the RTVIEvent.LLMFunctionCall event that is consumed by clients.
+        """
+        message_data = RTVILLMFunctionCallInProgressMessageData(
+            function_name=frame.function_name,
+            tool_call_id=frame.tool_call_id,
+            args=frame.arguments,
+        )
+        message = RTVILLMFunctionCallInProgressMessage(data=message_data)
+        await self.push_transport_message_urgent(message, exclude_none=False)
 
     async def _handle_function_call_result_frame(self, frame: FunctionCallResultFrame):
         """Process function call result frames for the RTVI client.
         
         This emits the RTVIEvent.LLMFunctionCall event that is consumed by clients.
         """
-        message_data = RTVILLMFunctionCallMessageData(
+        message_data = RTVILLMFunctionCallResultMessageData(
             function_name=frame.function_name,
             tool_call_id=frame.tool_call_id,
-            args=frame.arguments,
+            arguments=frame.arguments,
+            result=frame.result,
         )
-        message = RTVILLMFunctionCallMessage(data=message_data)
+        message = RTVILLMFunctionCallResultMessage(data=message_data)
         await self.push_transport_message_urgent(message, exclude_none=False)
 
 
@@ -842,7 +879,7 @@ class RTVIProcessor(FrameProcessor):
                     action_frame = RTVIActionFrame(message_id=message.id, rtvi_action_run=action)
                     await self._action_queue.put(action_frame)
                 case "llm-function-call-result":
-                    data = RTVILLMFunctionCallResultData.model_validate(message.data)
+                    data = RTVILLMFunctionCallResultMessageData.model_validate(message.data)
                     await self._handle_function_call_result(data)
                 case "raw-audio" | "raw-audio-batch":
                     await self._handle_audio_buffer(message.data)
