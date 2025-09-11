@@ -39,6 +39,7 @@ from pipecat.frames.frames import (
     EndTaskFrame,
     ErrorFrame,
     Frame,
+    FunctionCallInProgressFrame,
     FunctionCallResultFrame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
@@ -626,16 +627,29 @@ class RTVILLMFunctionCallStartMessage(BaseModel):
     data: RTVILLMFunctionCallStartMessageData
 
 
-class RTVILLMFunctionCallResultData(BaseModel):
-    """Data for LLM function call result.
+class RTVILLMFunctionCallInProgressMessageData(BaseModel):
+    function_name: str
+    tool_call_id: str
+    args: dict
 
-    Contains function call details and result.
-    """
 
+class RTVILLMFunctionCallInProgressMessage(BaseModel):
+    label: RTVIMessageLiteral = RTVI_MESSAGE_LABEL
+    type: Literal["llm-function-call"] = "llm-function-call"
+    data: RTVILLMFunctionCallInProgressMessageData
+
+
+class RTVILLMFunctionCallResultMessageData(BaseModel):
     function_name: str
     tool_call_id: str
     arguments: dict
     result: dict | str
+
+
+class RTVILLMFunctionCallResultMessage(BaseModel):
+    label: RTVIMessageLiteral = RTVI_MESSAGE_LABEL
+    type: Literal["llm-function-call"] = "llm-function-call"
+    data: RTVILLMFunctionCallResultMessageData
 
 
 class RTVIBotLLMStartedMessage(BaseModel):
@@ -833,15 +847,16 @@ class RTVIServerMessageFrame(SystemFrame):
 class RTVIObserverParams:
     """Parameters for configuring RTVI Observer behavior.
 
-    Parameters:
-        bot_llm_enabled: Indicates if the bot's LLM messages should be sent.
-        bot_tts_enabled: Indicates if the bot's TTS messages should be sent.
-        bot_speaking_enabled: Indicates if the bot's started/stopped speaking messages should be sent.
-        user_llm_enabled: Indicates if the user's LLM input messages should be sent.
-        user_speaking_enabled: Indicates if the user's started/stopped speaking messages should be sent.
-        user_transcription_enabled: Indicates if user's transcription messages should be sent.
-        metrics_enabled: Indicates if metrics messages should be sent.
-        errors_enabled: Indicates if errors messages should be sent.
+    Attributes:
+        bot_llm_enabled (bool): Indicates if the bot's LLM messages should be sent.
+        bot_tts_enabled (bool): Indicates if the bot's TTS messages should be sent.
+        bot_speaking_enabled (bool): Indicates if the bot's started/stopped speaking messages should be sent.
+        user_llm_enabled (bool): Indicates if the user's LLM input messages should be sent.
+        user_speaking_enabled (bool): Indicates if the user's started/stopped speaking messages should be sent.
+        user_transcription_enabled (bool): Indicates if user's transcription messages should be sent.
+        function_call_result_enabled (bool): Indicates if function call result messages should be sent.
+        metrics_enabled (bool): Indicates if metrics messages should be sent.
+        errors_enabled (bool): Indicates if errors messages should be sent.
     """
 
     bot_llm_enabled: bool = True
@@ -850,6 +865,7 @@ class RTVIObserverParams:
     user_llm_enabled: bool = True
     user_speaking_enabled: bool = True
     user_transcription_enabled: bool = True
+    function_call_result_enabled: bool = True
     metrics_enabled: bool = True
     errors_enabled: bool = True
 
@@ -943,11 +959,14 @@ class RTVIObserver(BaseObserver):
         elif isinstance(frame, RTVIServerMessageFrame):
             message = RTVIServerMessage(data=frame.data)
             await self.push_transport_message_urgent(message)
-        elif isinstance(frame, RTVIServerResponseFrame):
-            if frame.error is not None:
-                await self._send_error_response(frame)
-            else:
-                await self._send_server_response(frame)
+        elif isinstance(frame, FunctionCallInProgressFrame) and self._params.function_call_result_enabled:
+            # Only process the upstream FunctionCallInProgressFrame to avoid duplicates
+            if direction == FrameDirection.UPSTREAM:
+                await self._handle_function_call_in_progress(frame)
+        elif isinstance(frame, FunctionCallResultFrame) and self._params.function_call_result_enabled:
+            # Only process the upstream FunctionCallResultFrame to avoid duplicates
+            if direction == FrameDirection.UPSTREAM:
+                await self._handle_function_call_result_frame(frame)
 
         if mark_as_seen:
             self._frames_seen.add(frame.id)
@@ -1078,6 +1097,33 @@ class RTVIObserver(BaseObserver):
 
         message = RTVIMetricsMessage(data=metrics)
         await self.push_transport_message_urgent(message)
+    
+    async def _handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
+        """Process function call in progress frames for the RTVI client.
+        
+        This emits the RTVIEvent.LLMFunctionCall event that is consumed by clients.
+        """
+        message_data = RTVILLMFunctionCallInProgressMessageData(
+            function_name=frame.function_name,
+            tool_call_id=frame.tool_call_id,
+            args=frame.arguments,
+        )
+        message = RTVILLMFunctionCallInProgressMessage(data=message_data)
+        await self.push_transport_message_urgent(message, exclude_none=False)
+
+    async def _handle_function_call_result_frame(self, frame: FunctionCallResultFrame):
+        """Process function call result frames for the RTVI client.
+        
+        This emits the RTVIEvent.LLMFunctionCall event that is consumed by clients.
+        """
+        message_data = RTVILLMFunctionCallResultMessageData(
+            function_name=frame.function_name,
+            tool_call_id=frame.tool_call_id,
+            arguments=frame.arguments,
+            result=frame.result,
+        )
+        message = RTVILLMFunctionCallResultMessage(data=message_data)
+        await self.push_transport_message_urgent(message, exclude_none=False)
 
     async def _send_server_response(self, frame: RTVIServerResponseFrame):
         """Send a response to the client for a specific request."""
@@ -1413,7 +1459,7 @@ class RTVIProcessor(FrameProcessor):
                     action_frame = RTVIActionFrame(message_id=message.id, rtvi_action_run=action)
                     await self._action_queue.put(action_frame)
                 case "llm-function-call-result":
-                    data = RTVILLMFunctionCallResultData.model_validate(message.data)
+                    data = RTVILLMFunctionCallResultMessageData.model_validate(message.data)
                     await self._handle_function_call_result(data)
                 case "append-to-context":
                     data = RTVIAppendToContextData.model_validate(message.data)
